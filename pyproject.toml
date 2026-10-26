@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentstats"
+version = "0.2.0"
+description = "Statistics for LLM agent benchmark results: score noise, required runs and tasks, and ranking stability."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rohith Reddy Bellibatlu", email = "rohithreddybc@gmail.com" }]
+keywords = ["llm", "agents", "benchmark", "evaluation", "statistics", "variance components", "bootstrap", "reproducibility"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = ["numpy>=1.24", "pandas>=2.0", "scipy>=1.10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/rohithreddybc/agentstats"
+Repository = "https://github.com/rohithreddybc/agentstats"
+Issues = "https://github.com/rohithreddybc/agentstats/issues"
+Changelog = "https://github.com/rohithreddybc/agentstats/blob/main/CHANGELOG.md"
+
+[project.scripts]
+agentstats = "agentstats.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentstats"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SPEC.md", "/pyproject.toml"]
+exclude = ["__pycache__", "*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: tests that take more than ~20 s (run by default; deselect with -m 'not slow')"]
