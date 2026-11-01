@@ -226,4 +226,7 @@ def report(df: pd.DataFrame, n_boot: int = 2000, level: float = 0.95, rng=None) 
         L.append(f"- [!] Only {min_runs} runs per cell: variance components will be imprecise.")
     if len(common) < 100:
         L.append(f"- [!] {len(common)} tasks: small task sample; task-level uncertainty dominates.")
+    L += ["", "---", "Computed with agentstats (https://github.com/rohithreddybc/agentstats). If you report these numbers, "
+          "please cite: Bellibatlu and Singh, How Many Runs Is Enough? Rerun Noise, Rank Reversals and Run Budgets "
+          "for LLM Agent Benchmarks, 2026 (see CITATION.cff)."]
     return "\n".join(L) + "\n"

@@ -28,6 +28,7 @@ from .quantities import (
     fit_se_curve,
     pair_z,
     pair_z_table,
+    plan_second_stage,
     reversal_probability,
     run_disagreement,
     runs_needed,
@@ -44,7 +45,7 @@ from .variance import (
     variance_components_single,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "CI",
@@ -75,6 +76,7 @@ __all__ = [
     "paired_diff",
     "pass_at_k",
     "pass_hat_k",
+    "plan_second_stage",
     "rank_stability",
     "report",
     "reversal_probability",

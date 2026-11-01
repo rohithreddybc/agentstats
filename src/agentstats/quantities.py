@@ -7,6 +7,9 @@
   run-variance curve ``s_e(p) = kappa p (1 - p)`` it is evaluated on.  The design MDE is
   :func:`agentstats.mde`; fixed-task reliability is the ``fixed_tasks`` output of
   :func:`agentstats.d_study`.
+* :func:`plan_second_stage`: a two-stage adaptive design.  After a first pass of a few runs per
+  cell, it spends the rest of a fixed per-system budget on the cells whose outcomes disagree
+  (Neyman allocation on an add-smoothed estimate of the run SD).
 
 Estimands.  ``fixed_tasks``: the task set is the object of inference, only runs are random.
 ``task_population``: tasks are a sample from a population, tasks and runs are both random.
@@ -23,7 +26,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ._utils import check_estimand, check_int, check_level
+from ._utils import as_rng, check_estimand, check_int, check_level
 from .compare import _shared_tensor
 from .data import Tensor, build_tensor, prep
 
@@ -35,6 +38,7 @@ __all__ = [
     "fit_se_curve",
     "pair_z",
     "pair_z_table",
+    "plan_second_stage",
     "reversal_probability",
     "run_disagreement",
     "runs_needed",
@@ -166,12 +170,18 @@ def run_disagreement(df: pd.DataFrame, s_pt: float | None = None) -> RunDisagree
     ``s_pt`` is estimated from the unweighted cell means ``m_pt`` (needs every system x task
     cell present, >= 2 systems and >= 2 tasks)::
 
-        s_pt = max(MS_pt* - s_e * mean_c(1 / R_c), 0)
+        s_pt = max(MS_pt* - mean_c(s2_c / R_c), 0)
 
     where ``MS_pt*`` is the interaction mean square of the two-way table of cell means, with
-    ``(P - 1)(T - 1)`` degrees of freedom.  Since ``E[MS_pt*] = s_pt + s_e * mean_c(1 / R_c)``
-    exactly, this is unbiased before truncation and equals the ANOVA estimator of
-    :func:`variance_components` on balanced data.  On an incomplete design ``s_pt`` and
+    ``(P - 1)(T - 1)`` degrees of freedom, and ``s2_c`` is the unbiased within-cell run variance
+    of cell ``c`` (``R_c`` runs).  With heterogeneous cell variances ``sigma2_c`` (binary
+    outcomes), ``E[MS_pt*] = s_pt + mean_c(sigma2_c / R_c)`` exactly, so subtracting
+    ``mean_c(s2_c / R_c)`` is unbiased before truncation.  The earlier form
+    ``s_e * mean_c(1 / R_c)`` (product of means) is biased when cell variance and run count are
+    associated (fixed in 0.2.1).  A cell with a single run has no ``s2_c``; its term uses the
+    pooled ``s_e``, so the correction is exact only when every cell has >= 2 runs.  On balanced
+    data (equal ``R_c >= 2``) the two forms coincide and the estimate equals the ANOVA estimator
+    of :func:`variance_components`.  On an incomplete design ``s_pt`` and
     ``rho_run`` are NaN (with a warning) while ``D`` is unaffected.  Pass ``s_pt`` to use a
     value computed elsewhere (for example from a balanced subset); ``s_pt_method`` then reads
     ``"supplied"``.
@@ -212,8 +222,9 @@ def run_disagreement(df: pd.DataFrame, s_pt: float | None = None) -> RunDisagree
     elif t.complete and P >= 2 and T >= 2:
         mp, mt, gm = cm.mean(1), cm.mean(0), cm.mean()
         ms_pt = ((cm - mp[:, None] - mt[None, :] + gm) ** 2).sum() / ((P - 1) * (T - 1))
-        spt = max(float(ms_pt - s_e * (1.0 / t.counts).mean()), 0.0)
-        method = "unweighted cell-mean interaction MS minus s_e * mean(1/R_c), truncated at 0"
+        s2f = np.where(ok, s2, s_e)  # single-run cells: pooled s_e stands in for s2_c
+        spt = max(float(ms_pt - (s2f / t.counts).mean()), 0.0)
+        method = "unweighted cell-mean interaction MS minus mean(s2_c / R_c), truncated at 0"
     else:
         spt, method = float("nan"), "unavailable: incomplete system x task design"
         warnings.warn(
@@ -279,21 +290,25 @@ def _pair_row(t: Tensor, s2: np.ndarray, ia: int, ib: int, s_e: Mapping | float 
         sid = t.systems[i]
         if s_e is None:
             v = s2[i][both]
-            v = v[np.isfinite(v)]
-            if v.size == 0:
+            fin = np.isfinite(v)
+            if not fin.any():
                 raise ValueError(
                     f"system {sid!r} has no shared task with >= 2 runs to estimate s_e; pass s_e"
                 )
-            se_i = float(v.mean())
-        elif isinstance(s_e, Mapping):
-            if sid not in s_e:
-                raise ValueError(f"s_e has no entry for system {sid!r}")
-            se_i = float(s_e[sid])
+            # per-cell unbiased variance; cells with a single run take the system's mean s2
+            s2_cells = np.where(fin, v, v[fin].mean())
         else:
-            se_i = float(s_e)
-        if not (np.isfinite(se_i) and se_i >= 0):
-            raise ValueError("s_e must be finite and >= 0")
-        parts.append(se_i * float((1.0 / t.counts[i][both]).mean()))
+            if isinstance(s_e, Mapping):
+                if sid not in s_e:
+                    raise ValueError(f"s_e has no entry for system {sid!r}")
+                se_i = float(s_e[sid])
+            else:
+                se_i = float(s_e)
+            if not (np.isfinite(se_i) and se_i >= 0):
+                raise ValueError("s_e must be finite and >= 0")
+            s2_cells = np.full(int(both.sum()), se_i)
+        # sum_t s2_t / R_t (not mean(s2) * mean(1/R): biased for unequal R, see pair_z)
+        parts.append(float((s2_cells / t.counts[i][both]).sum()) / T)
     se_diff = float(np.sqrt(sum(parts) / T))
     with np.errstate(divide="ignore", invalid="ignore"):
         z = gap / se_diff if se_diff > 0 else (0.0 if gap == 0 else float("inf") * np.sign(gap))
@@ -306,13 +321,18 @@ def pair_z(df: pd.DataFrame, sys_a: str, sys_b: str, s_e: Mapping | float | None
     Estimand: ``fixed_tasks``.  Over the ``T`` tasks both systems share,
     ``gap = mean_t(m_a,t - m_b,t)`` (cell means) and
 
-        SE_diff^2 = ( s_e,a * mean_t(1 / R_a,t) + s_e,b * mean_t(1 / R_b,t) ) / T
+        SE_diff^2 = T^-2 * sum_t ( s2_a,t / R_a,t + s2_b,t / R_b,t )
 
-    which is ``(s_e,a + s_e,b) / (T k)`` when every cell has ``k`` runs.  ``s_e,a`` is the mean
-    unbiased run variance of the system over its shared-task cells with >= 2 runs, unless ``s_e``
-    is given (a float for both systems, or a mapping ``system_id -> s_e``), which is required
-    when a system has no cell with 2 runs, for example a single-run evaluation using the
-    full-data ``s_e``.  ``z = gap / SE_diff`` is signed; ``psi = reversal_probability(z)``.
+    where ``s2_a,t`` is the unbiased run variance of the cell (system ``a``, task ``t``) and
+    ``R_a,t`` its number of runs.  This is unbiased for the fixed-task variance of the gap even
+    when the runs per cell differ and the cell variances are heterogeneous (binary outcomes);
+    versions before 0.2.1 used ``mean_t(s2) * mean_t(1 / R)``, which is biased in that case.
+    It equals ``(s_e,a + s_e,b) / (T k)`` when every cell has ``k`` runs, with ``s_e,a`` the
+    mean cell variance, so balanced designs are unchanged.  A shared cell with a single run has
+    no ``s2``; it takes the system's mean ``s2`` over its cells with >= 2 runs.  If ``s_e`` is
+    given (a float for both systems, or a mapping ``system_id -> s_e``) it replaces every
+    ``s2_a,t`` of that system; this is required when a system has no cell with 2 runs, for
+    example a single-run evaluation using the full-data ``s_e``.  ``z = gap / SE_diff`` is signed; ``psi = reversal_probability(z)``.
     """
     if sys_a == sys_b:
         raise ValueError("sys_a and sys_b must differ")
@@ -443,3 +463,151 @@ def runs_needed(
         cont = 2.0 * s_e / slack
     n_r = max(1, int(np.ceil(cont - 1e-12)))
     return RunsNeeded(n_r, float(cont), True, float(d), float(n_t), float(s_e), risk, estimand, **meta)
+
+
+# ---------------------------------------------------------------------------------------------
+# Two-stage adaptive allocation
+# ---------------------------------------------------------------------------------------------
+
+
+def _neyman_integer(weights, lo, hi, total, rng=None) -> np.ndarray:
+    """Integer Neyman allocation along the last axis, vectorised over the leading axes.
+
+    Minimises ``sum_t w_t^2 / n_t`` subject to ``sum_t n_t = total`` and ``lo_t <= n_t <= hi_t``.
+    The continuous optimum is ``n_t = clip(lam * w_t, lo_t, hi_t)`` with ``lam`` found by bisection
+    (the sum is non-decreasing in ``lam``).  The continuous solution is rounded down and the
+    remaining runs are handed out one each by systematic random rounding: cell ``t`` gets the extra
+    run with probability equal to its fractional part (so ``E[n_t]`` is the continuous optimum),
+    with the row total exact and the cells visited in random order.  (Rounding to the largest
+    fractional parts instead would erase differences smaller than one run.)
+    ``weights`` must be positive; ``lo``, ``hi`` broadcast to ``weights``; ``total`` broadcasts to
+    its leading axes and must lie in ``[sum lo, sum hi]``.  Returns an integer array of the shape
+    of ``weights`` whose rows sum to ``total``.
+    """
+    w = np.asarray(weights, dtype=float)
+    if w.ndim == 0:
+        raise ValueError("weights must have at least one axis")
+    if not (np.isfinite(w).all() and (w > 0).all()):
+        raise ValueError("weights must be finite and > 0")
+    lo = np.broadcast_to(np.asarray(lo, dtype=float), w.shape)
+    hi = np.broadcast_to(np.asarray(hi, dtype=float), w.shape)
+    tot = np.broadcast_to(np.asarray(total, dtype=float), w.shape[:-1])
+    if (lo > hi).any():
+        raise ValueError("lo must not exceed hi")
+    if (tot < lo.sum(-1) - 1e-9).any() or (tot > hi.sum(-1) + 1e-9).any():
+        raise ValueError("total must lie between sum(lo) and sum(hi)")
+    rng = as_rng(rng)
+    lam_lo = np.zeros(w.shape[:-1])
+    lam_hi = (hi / w).max(-1)  # every cell is at hi here, so the sum is sum(hi) >= total
+    for _ in range(50):
+        mid = 0.5 * (lam_lo + lam_hi)
+        small = np.clip(mid[..., None] * w, lo, hi).sum(-1) < tot
+        lam_lo = np.where(small, mid, lam_lo)
+        lam_hi = np.where(small, lam_hi, mid)
+    n = np.clip(0.5 * (lam_lo + lam_hi)[..., None] * w, lo, hi)
+    base = np.floor(n)
+    frac = np.where(base < hi, n - base, 0.0)
+    rest = tot - base.sum(-1)  # runs still to hand out, one each
+    fs = frac.sum(-1)
+    frac = frac * (np.where(fs > 0, rest / np.where(fs > 0, fs, 1.0), 0.0))[..., None]  # sum(frac) == rest exactly
+    # systematic (dependent) rounding: cell t gets one extra run with probability frac_t, the row total is exact,
+    # and the cells are visited in random order so no task is favoured by its position
+    order = np.argsort(rng.random(w.shape), axis=-1)
+    cum = np.cumsum(np.take_along_axis(frac, order, axis=-1), axis=-1)
+    u = rng.random(w.shape[:-1])[..., None]
+    pick = np.floor(cum + u) - np.floor(cum - np.take_along_axis(frac, order, axis=-1) + u)
+    add = np.zeros(w.shape)
+    np.put_along_axis(add, order, np.clip(pick, 0, 1), axis=-1)
+    return (base + add).astype(np.int64)
+
+
+def plan_second_stage(
+    df_stage1: pd.DataFrame,
+    budget,
+    floor: int = 0,
+    r_max: int | None = None,
+    smoothing: float = 0.5,
+    rng=None,
+) -> pd.DataFrame:
+    """Runs per (system, task) for the second stage of a two-stage adaptive design.
+
+    Estimand: ``fixed_tasks``.  Stage 1 is a first pass with ``n1`` runs per cell (``df_stage1``,
+    long format, ragged ``n1`` allowed).  The system's mean score is the mean over tasks of the
+    cell means, whose variance is ``T^-2 sum_t s2_t / n_t`` (cell run variance ``s2_t``, ``n_t``
+    runs in total); for a fixed total ``sum_t n_t`` it is smallest for ``n_t`` proportional to the
+    cell run SD (Neyman allocation).  The cell SD is estimated from stage 1 with add-``smoothing``
+    smoothing, ``p = (k + a) / (n1 + 2a)`` and ``sd = sqrt(p (1 - p))`` for ``k`` the summed stage-1
+    score, so cells whose first runs agree keep a positive weight (``a = 0.5`` is
+    ``(k + 0.5) / (n1 + 1)``).  The scores are treated as success indicators; for scores strictly
+    inside ``(0, 1)`` the weight is an approximation.
+
+    ``budget`` is the total number of runs per system, stage 1 included (an int for every
+    system, or a mapping ``system_id -> int``).  Each cell gets at least ``n1 + floor`` runs
+    (``floor`` extra runs for every cell, 0 by default) and at most ``r_max`` (default: no cap).
+    The continuous allocation is rounded so each system's ``n_total`` sums exactly to its budget;
+    rounding ties are broken at random with ``rng``.  When ``budget`` exceeds ``r_max`` times the
+    number of cells, every cell gets ``r_max`` and a warning is issued.
+
+    Returns one row per cell: ``system_id, task_id, n_stage1, n_stage2, n_total, p_smoothed,
+    weight``.
+
+    Caution: the allocation depends on the stage-1 outcomes, so the plain cell means of an
+    adaptive design are biased estimates of the cell means, and the ragged fixed-task variance of
+    :func:`pair_z` (which assumes run counts fixed in advance) under-covers.  On resampled public
+    releases (``n1 = 2``, three runs per task) the 95% interval covered the full-data score in only
+    0.69 to 0.88 of repetitions, the bias of a system's score reached about one percentage point
+    with the default settings (about three with other tunings), and the design saved no runs once
+    bias was counted (mean squared error) or when runs were drawn fresh.  Use uniform runs per task unless a run-variance estimate for each task exists that does
+    not come from the system's own pilot runs (for example from other systems or earlier
+    releases); such an allocation keeps the cell means unbiased.  This function is kept for
+    experimentation, not as a recommended design.
+    """
+    df = prep(df_stage1)
+    floor = check_int(floor, "floor", 0)
+    if r_max is not None:
+        r_max = check_int(r_max, "r_max", 1)
+    if not (np.isfinite(smoothing) and smoothing > 0):
+        raise ValueError(f"smoothing must be a positive finite number, got {smoothing!r}")
+    rng = as_rng(rng)
+    g = df.groupby(["system_id", "task_id"], sort=True)["score"].agg(["size", "sum"]).reset_index()
+    out = []
+    for sid, sub in g.groupby("system_id", sort=True):
+        if isinstance(budget, Mapping):
+            if sid not in budget:
+                raise ValueError(f"budget has no entry for system {sid!r}")
+            b = check_int(budget[sid], f"budget[{sid!r}]", 1)
+        else:
+            b = check_int(budget, "budget", 1)
+        n1 = sub["size"].to_numpy(dtype=np.int64)
+        k = sub["sum"].to_numpy(dtype=float)
+        lo = n1 + floor
+        hi = np.full(len(n1), b if r_max is None else r_max, dtype=np.int64)
+        if (lo > hi).any():
+            raise ValueError(f"system {sid!r}: r_max={r_max} is below stage-1 runs + floor for some cell")
+        if b < int(n1.sum()):
+            raise ValueError(f"system {sid!r}: budget {b} is below its {int(n1.sum())} stage-1 runs")
+        if b < int(lo.sum()):
+            raise ValueError(f"system {sid!r}: budget {b} is below stage-1 runs + floor ({int(lo.sum())})")
+        if b > int(hi.sum()):
+            warnings.warn(
+                f"plan_second_stage: budget {b} of system {sid!r} exceeds r_max x cells = {int(hi.sum())}; every cell gets r_max",
+                stacklevel=2,
+            )
+            b = int(hi.sum())
+        p = (k + smoothing) / (n1 + 2.0 * smoothing)
+        w = np.sqrt(p * (1.0 - p))
+        n_tot = _neyman_integer(w, lo, hi, b, rng)
+        out.append(
+            pd.DataFrame(
+                dict(
+                    system_id=sid,
+                    task_id=sub["task_id"].to_numpy(),
+                    n_stage1=n1,
+                    n_stage2=n_tot - n1,
+                    n_total=n_tot,
+                    p_smoothed=p,
+                    weight=w,
+                )
+            )
+        )
+    return pd.concat(out, ignore_index=True)

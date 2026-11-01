@@ -98,6 +98,7 @@ One function per quantity of the paper, each with its estimand in the docstring.
 | Q3 reversal probability `Phi(-abs(z)/sqrt(2))` and pair-level `z` | `reversal_probability(z)`, `pair_z(df, a, b)`, `pair_z_table(df)` | `fixed_tasks` |
 | Q4 runs needed `n_r*(d)`: smallest `n_r` whose design MDE (two-sided `alpha`, `power`) is `<= d`; `criterion="reversal"` gives the weaker `n_r_rev(d)` with `Phi(-d/SE) <= risk` | `runs_needed(d, s_e, n_t, estimand=..., criterion="power", alpha=0.05, power=0.8)` | both |
 | Q4 design MDE | `mde(...)` | both |
+| two-stage adaptive allocation: second-stage runs per cell, Neyman on the run SD estimated from stage 1 (add-smoothed), per-system budget, floor and cap | `plan_second_stage(df_stage1, budget, floor=0, r_max=None, smoothing=0.5)` | `fixed_tasks` |
 
 `claim_check` returns the verdicts `"clear"` (p < 0.005), `"marginal"` (0.005 <= p < 0.05) and
 `"not distinguishable"` (p >= 0.05). The MDE is reported as a property of the design and never

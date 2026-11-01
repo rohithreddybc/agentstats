@@ -265,12 +265,147 @@ def test_pair_z_ragged_formula_by_hand():
     g = d.groupby(["system_id", "task_id"]).score.agg(["mean", "var", "count"])
     a, b = g.loc["s00"], g.loc["s01"]
     gap = (a["mean"] - b["mean"]).mean()
-    se2 = (a["var"].mean() * (1 / a["count"]).mean() + b["var"].mean() * (1 / b["count"]).mean()) / len(a)
+    T = len(a)
+    se2 = ((a["var"] / a["count"]).sum() + (b["var"] / b["count"]).sum()) / T**2
     assert pz.gap == pytest.approx(gap) and pz.se_diff == pytest.approx(np.sqrt(se2))
     assert pz.z == pytest.approx(gap / np.sqrt(se2))
     assert pz.psi == pytest.approx(stats.norm.cdf(-abs(pz.z) / np.sqrt(2)))
     with pytest.raises(ValueError):
         ast.pair_z(d, "s00", "s00")
+
+
+# ---- ragged fixed-task variance (fixed in 0.2.1): T^-2 sum_t s2_t / R_t, not mean(s2) * mean(1/R)
+
+
+def _long(cells):
+    """Long frame from ``{(system, task): [scores...]}``."""
+    rows = [(sid, tid, r, float(v)) for (sid, tid), vs in cells.items() for r, v in enumerate(vs)]
+    df = pd.DataFrame(rows, columns=["system_id", "task_id", "run_id", "score"])
+    df.insert(0, "benchmark", "b")
+    return df
+
+
+def test_pair_z_variance_exactly_unbiased_two_task_counterexample():
+    # Each system: task A ~ Bernoulli(1/2) with 2 runs, task B deterministic (all 1) with 10 runs.
+    # True Var(gap) = 2 * (1/4) * Var(mean of 2 Bernoulli(1/2)) = 2 * (1/4) * (1/8) = 1/16.
+    # The pre-0.2.1 formula has expectation 3/80 (40% too low); enumerate all outcomes exactly.
+    ks = [(0, 1 / 4), (1, 1 / 2), (2, 1 / 4)]
+    e_new = e_old = 0.0
+    var_gap = 0.0
+    for ka, pa in ks:
+        for kb, pb in ks:
+            w = pa * pb
+            cells = {}
+            for sid, k in (("a", ka), ("b", kb)):
+                cells[(sid, "A")] = [1.0] * k + [0.0] * (2 - k)
+                cells[(sid, "B")] = [1.0] * 10
+            pz = ast.pair_z(_long(cells), "a", "b")
+            e_new += w * pz.se_diff**2
+            var_gap += w * pz.gap**2  # true mean gap is 0
+            old = 0.0
+            for sid, k in (("a", ka), ("b", kb)):
+                s2 = [0.5 if k == 1 else 0.0, 0.0]
+                old += np.mean(s2) * np.mean([1 / 2, 1 / 10]) / 2
+            e_old += w * old
+    assert var_gap == pytest.approx(1 / 16, abs=1e-15)
+    assert e_new == pytest.approx(1 / 16, abs=1e-15)
+    assert e_old == pytest.approx(3 / 80, abs=1e-15)  # documents the old bias
+
+
+def _old_pair_se2(df, a, b):
+    """Pre-0.2.1 pair_z formula, kept here only to prove balanced designs are unchanged."""
+    g = df.groupby(["system_id", "task_id"]).score.agg(["var", "count"])
+    out = 0.0
+    for sid in (a, b):
+        x = g.loc[sid]
+        out += x["var"].mean() * (1.0 / x["count"]).mean()
+    return out / len(g.loc[a])
+
+
+@pytest.mark.parametrize("kind", ["binary", "continuous"])
+def test_balanced_design_unchanged_by_ragged_fix(kind):
+    rng = np.random.default_rng(11)
+    P, T, R = 4, 50, 6
+    if kind == "binary":
+        y = (rng.random((P, T, R)) < rng.beta(0.6, 0.6, (P, T, 1))).astype(float)
+    else:
+        y = np.clip(rng.normal(0.5, 0.2, (P, T, R)), 0.0, 1.0)
+    df = df_from_array(y)
+    for a, b in (("s000", "s001"), ("s001", "s003")):
+        assert ast.pair_z(df, a, b).se_diff**2 == pytest.approx(_old_pair_se2(df, a, b), rel=1e-12)
+    tab = ast.pair_z_table(df)
+    for _, row in tab.iterrows():
+        assert row.se_diff**2 == pytest.approx(_old_pair_se2(df, row.system_a, row.system_b), rel=1e-12)
+    # supplied s_e: old = s_e/(T R) per system, new = same
+    pz = ast.pair_z(df, "s000", "s001", s_e=0.07)
+    assert pz.se_diff**2 == pytest.approx(2 * 0.07 / (T * R), rel=1e-12)
+    # s_pt: old correction s_e * mean(1/R) = s_e / R equals the new mean(s2/R)
+    rd = ast.run_disagreement(df)
+    ms_pt = _interaction_ms(y.mean(-1))
+    assert rd.s_pt == pytest.approx(max(ms_pt - rd.s_e / R, 0.0), rel=1e-12)
+    vc = ast.variance_components(df)
+    assert rd.s_pt == pytest.approx(vc.sigma2_pt, abs=1e-12)
+
+
+def _interaction_ms(cm):
+    P, T = cm.shape
+    r = cm - cm.mean(1, keepdims=True) - cm.mean(0, keepdims=True) + cm.mean()
+    return float((r**2).sum() / ((P - 1) * (T - 1)))
+
+
+def _ragged_binary_df(rng, pi, R):
+    """Binary runs for fixed cell probabilities ``pi`` (P, T) with run counts ``R`` (P, T)."""
+    P, T = pi.shape
+    rows = []
+    for p in range(P):
+        for t in range(T):
+            draws = (rng.random(R[p, t]) < pi[p, t]).astype(float)
+            rows.extend((f"s{p}", f"t{t:03d}", r, v) for r, v in enumerate(draws))
+    df = pd.DataFrame(rows, columns=["system_id", "task_id", "run_id", "score"])
+    df.insert(0, "benchmark", "b")
+    return df
+
+
+def test_pair_z_se_coverage_heterogeneous_binary_ragged_runs():
+    # Fixed tasks, binary cells: probabilities near 1/2 get 2 runs, extreme ones get 12, so cell
+    # variance and run count are strongly associated (the case the old formula got wrong).
+    rng = np.random.default_rng(2026)
+    T = 80
+    pi = np.stack([rng.beta(0.5, 0.5, T), rng.beta(0.5, 0.5, T)])
+    pi = np.clip(pi, 0.02, 0.98)
+    R = np.where(np.abs(pi - 0.5) < 0.3, 2, 12)
+    truth = float((pi[0] - pi[1]).mean())
+    var_true = float((pi * (1 - pi) / R).sum() / T**2)
+    covered = covered_old = 0
+    se2_new, se2_old = [], []
+    reps = 1500
+    for _ in range(reps):
+        df = _ragged_binary_df(rng, pi, R)
+        pz = ast.pair_z(df, "s0", "s1")
+        covered += abs(pz.gap - truth) <= 1.959964 * pz.se_diff
+        covered_old += abs(pz.gap - truth) <= 1.959964 * np.sqrt(_old_pair_se2(df, "s0", "s1"))
+        se2_new.append(pz.se_diff**2)
+        se2_old.append(_old_pair_se2(df, "s0", "s1"))
+    # the estimator is unbiased for the true fixed-task variance; the old one is not
+    assert np.mean(se2_new) == pytest.approx(var_true, rel=0.04)
+    assert abs(np.mean(se2_old) / var_true - 1) > 0.10
+    cov, cov_old = covered / reps, covered_old / reps
+    assert 0.93 <= cov <= 0.97, cov  # nominal 0.95, MC s.e. ~ 0.006
+    assert cov_old < cov
+
+
+def test_s_pt_correction_unbiased_heterogeneous_binary_ragged_runs():
+    rng = np.random.default_rng(5)
+    P, T = 4, 60
+    base = rng.beta(0.6, 0.6, (1, T))
+    pi = np.clip(base + rng.normal(0, 0.25, (P, T)), 0.02, 0.98)  # strong interaction
+    R = np.where(np.abs(pi - 0.5) < 0.3, 2, 9)
+    target = _interaction_ms(pi)  # E[MS_pt*] - mean(sigma2/R) is the interaction MS of the true table
+    est = []
+    for _ in range(300):
+        df = _ragged_binary_df(rng, pi, R)
+        est.append(ast.run_disagreement(df).s_pt)
+    assert np.mean(est) == pytest.approx(target, rel=0.05)
 
 
 # ------------------------------------------------------------------------------ Q4: runs needed
@@ -384,10 +519,113 @@ def test_design_mde_matches_paper_formula(paper):
         assert 100 * ast.mde(s_d, s_e, n_t, nr, estimand="task_population") == pytest.approx(pop, rel=1e-12)
 
 
+# ----------------------------------------------------------------------------------- plan_second_stage
+def _stage1(rng, P=3, T=60, n1=2, hetero=True):
+    """Stage-1 frame: half of the tasks have p ~ 0.5, half p ~ 0.02 or 0.98."""
+    p = np.where(np.arange(T) % 2 == 0, 0.5, np.where(rng.random(T) < 0.5, 0.02, 0.98)) if hetero else np.full(T, 0.5)
+    y = (rng.random((P, T, n1)) < p[None, :, None]).astype(float)
+    return df_from_array(y), p
+
+
+def test_plan_second_stage_budget_bounds_and_columns():
+    rng = np.random.default_rng(3)
+    df, _ = _stage1(rng, P=3, T=60, n1=2)
+    for floor, r_max, budget in ((0, 6, 240), (1, 6, 240), (0, None, 200), (0, 4, 4 * 60)):
+        plan = ast.plan_second_stage(df, budget, floor=floor, r_max=r_max, rng=1)
+        assert list(plan.columns) == ["system_id", "task_id", "n_stage1", "n_stage2", "n_total", "p_smoothed", "weight"]
+        assert len(plan) == 3 * 60
+        assert (plan.n_total == plan.n_stage1 + plan.n_stage2).all()
+        assert (plan.groupby("system_id").n_total.sum() == budget).all()
+        assert (plan.n_stage2 >= floor).all()
+        if r_max is not None:
+            assert (plan.n_total <= r_max).all()
+
+
+def test_plan_second_stage_sends_runs_to_disagreeing_cells_and_matches_neyman():
+    rng = np.random.default_rng(4)
+    df, _ = _stage1(rng, P=2, T=400, n1=2)
+    plan = ast.plan_second_stage(df, 5 * 400, r_max=10, smoothing=0.1, rng=2)
+    k = df.groupby(["system_id", "task_id"]).score.sum().reset_index(name="k")
+    plan = plan.merge(k, on=["system_id", "task_id"])
+    mixed = plan[plan.k == 1].n_total.mean()
+    same = plan[plan.k != 1].n_total.mean()
+    assert mixed > same + 1.5
+    # unclipped cells: n_total / weight is constant up to rounding (Neyman); clipped cells sit at the bounds
+    free = plan[(plan.n_total > 2) & (plan.n_total < 10)]
+    lam = free.n_total.sum() / free.weight.sum()
+    assert ((free.n_total - lam * free.weight).abs() <= 1.0 + 1e-9).all()
+    # equal stage-1 outcomes in every cell -> equal weights -> uniform allocation (up to a unit)
+    flat = df.assign(score=0.0)
+    pf = ast.plan_second_stage(flat, 4 * 400, rng=5)
+    assert pf.n_total.between(4, 4).all()
+
+
+def test_plan_second_stage_tie_breaking_is_random_and_seeded():
+    rng = np.random.default_rng(5)
+    df, _ = _stage1(rng, P=1, T=50, n1=2, hetero=False)
+    df = df.assign(score=0.0)  # every cell ties; 125 runs = 2.5 per cell
+    a = ast.plan_second_stage(df, 125, rng=11).n_total.to_numpy()
+    b = ast.plan_second_stage(df, 125, rng=11).n_total.to_numpy()
+    c = ast.plan_second_stage(df, 125, rng=12).n_total.to_numpy()
+    assert (a == b).all() and (a != c).any()
+    hits = np.mean([ast.plan_second_stage(df, 125, rng=s).n_total.to_numpy() for s in range(200)], axis=0)
+    assert hits.min() > 2.3 and hits.max() < 2.7  # no task is favoured by position
+
+
+def test_plan_second_stage_errors_mapping_and_cap_warning():
+    rng = np.random.default_rng(6)
+    df, _ = _stage1(rng, P=2, T=10, n1=2)
+    with pytest.raises(ValueError, match="stage-1 runs"):
+        ast.plan_second_stage(df, 19)
+    with pytest.raises(ValueError, match="floor"):
+        ast.plan_second_stage(df, 25, floor=1)
+    with pytest.raises(ValueError, match="r_max"):
+        ast.plan_second_stage(df, 40, r_max=2, floor=1)
+    with pytest.raises(ValueError, match="smoothing"):
+        ast.plan_second_stage(df, 40, smoothing=0.0)
+    with pytest.raises(ValueError, match="no entry"):
+        ast.plan_second_stage(df, {"s000": 40})
+    plan = ast.plan_second_stage(df, {"s000": 30, "s001": 50}, rng=1)
+    assert plan.groupby("system_id").n_total.sum().to_dict() == {"s000": 30, "s001": 50}
+    with pytest.warns(UserWarning, match="exceeds"):
+        pc = ast.plan_second_stage(df, 100, r_max=4, rng=1)
+    assert (pc.n_total == 4).all()
+
+
+def test_plan_second_stage_minimises_neyman_objective_and_follows_the_smoothed_weights():
+    """With the stage-1 weights taken as the cell SDs, the plan's sum_t w_t^2 / n_t beats the uniform allocation of the same budget
+    and is within rounding of the continuous optimum (sum w)^2 / budget when no bound binds."""
+    rng = np.random.default_rng(8)
+    df, _ = _stage1(rng, P=2, T=300, n1=3)
+    for a in (0.5, 0.1):
+        plan = ast.plan_second_stage(df, 6 * 300, r_max=30, smoothing=a, rng=1)
+        for _, g in plan.groupby("system_id"):
+            obj = (g.weight**2 / g.n_total).sum()
+            assert obj < (g.weight**2).sum() / 6.0 - 1e-6  # uniform allocation of the same budget
+            assert obj <= (g.weight.sum()) ** 2 / (6 * 300) * 1.01  # continuous optimum, 1% for integer rounding
+
+
+def test_plan_second_stage_mean_is_nearly_unbiased_for_binary_runs():
+    """Monte Carlo: the number of runs of a cell depends on its stage-1 outcomes, so the pooled mean is not exactly unbiased; the bias is small."""
+    rng = np.random.default_rng(7)
+    T, R, B = 100, 8, 4 * 100
+    p = np.where(np.arange(T) % 2 == 0, 0.5, np.where(np.arange(T) % 4 == 1, 0.05, 0.95))
+    est = []
+    for _ in range(400):
+        y = (rng.random((1, T, R)) < p[None, :, None]).astype(float)
+        full = df_from_array(y)
+        plan = ast.plan_second_stage(full[full.run_id < 2], B, r_max=R, smoothing=0.5, rng=rng)
+        keep = full.merge(plan[["task_id", "n_total"]], on="task_id")
+        sub = keep[keep.run_id < keep.n_total]
+        est.append(sub.groupby("task_id").score.mean().mean())
+    est = np.array(est)
+    assert abs(est.mean() - p.mean()) < 4 * est.std(ddof=1) / np.sqrt(len(est)) + 0.003
+
+
 def test_public_api_exports():
-    for name in ("run_disagreement", "reversal_probability", "pair_z", "pair_z_table", "runs_needed", "fit_se_curve"):
+    for name in ("run_disagreement", "reversal_probability", "pair_z", "pair_z_table", "runs_needed", "fit_se_curve", "plan_second_stage"):
         assert name in ast.__all__ and callable(getattr(ast, name))
-    assert ast.__version__ == "0.2.0"
+    assert ast.__version__ == "0.2.1"
 
 
 def test_readme_quickstart_runs():

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-10-31
+
+Added
+- `plan_second_stage(df_stage1, budget, floor, r_max, smoothing, rng)`: second-stage runs per (system, task) of a two-stage adaptive design (Neyman allocation on an add-smoothed stage-1 run SD, per-system budget, floor and cap, exact budget after integer rounding).
+
+Fixed
+- Fixed-task variance with unequal runs per cell. `pair_z`/`pair_z_table` computed `SE_diff^2` from `mean_t(s2) * mean_t(1/R)`; it is now the unbiased `T^-2 * sum_t s2_t / R_t` (per system, summed over both systems). The ragged interaction-variance correction in `run_disagreement` (`s_pt`, `rho_run`) subtracted `s_e * mean_c(1/R_c)` and now subtracts `mean_c(s2_c / R_c)`. Both differed from the correct value when cell variance and run count are associated (for example binary outcomes with unequal `R`); results for equal runs per cell are identical to 0.2.0.
+
 ## 0.2.0 - 2026-10-19
 
 Added

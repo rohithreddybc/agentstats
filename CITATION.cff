@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use agentstats, please cite the paper below."
+title: "agentstats"
+version: 0.2.1
+license: MIT
+repository-code: "https://github.com/rohithreddybc/agentstats"
+authors:
+  - family-names: Bellibatlu
+    given-names: Rohith Reddy
+    email: rohithreddybc@gmail.com
+  - family-names: Singh
+    given-names: Manpreet
+preferred-citation:
+  type: article
+  title: "How Many Runs Is Enough? Rerun Noise, Rank Reversals and Run Budgets for LLM Agent Benchmarks"
+  authors:
+    - family-names: Bellibatlu
+      given-names: Rohith Reddy
+    - family-names: Singh
+      given-names: Manpreet
+  year: 2026
+  notes: "Preprint; arXiv identifier to be added on posting."
